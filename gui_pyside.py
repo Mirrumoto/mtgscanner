@@ -923,7 +923,7 @@ class MainWindow(QMainWindow):
 
         form_layout.addWidget(QLabel("Unsloth Base URL"), 3, 0)
         self.settings_unsloth_base_url_edit = QLineEdit()
-        self.settings_unsloth_base_url_edit.setPlaceholderText("http://127.0.0.1:8080/v1")
+        self.settings_unsloth_base_url_edit.setPlaceholderText("Auto-detected on startup or e.g. http://127.0.0.1:11434/v1")
         form_layout.addWidget(self.settings_unsloth_base_url_edit, 3, 1)
 
         form_layout.addWidget(QLabel("Default Scan Pricing Source"), 4, 0)
@@ -1066,7 +1066,7 @@ class MainWindow(QMainWindow):
         return {
             "vision_provider": "gemini",
             "vision_model": "gemini-2.5-flash",
-            "unsloth_base_url": "http://127.0.0.1:8080/v1",
+            "unsloth_base_url": "",
             "scan_pricing_source": "mtgjson",
             "scan_pricing_provider": "tcgplayer",
             "scan_pricing_side": "retail",

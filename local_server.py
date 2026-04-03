@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -63,6 +64,36 @@ def _default_command_candidates() -> list[str]:
         ]
 
     return candidates
+
+
+def _normalize_command_text(command: str) -> str:
+    text = str(command or "").strip().lower()
+    text = text.replace("\\", "/")
+    text = re.sub(r'["\']', " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _classify_backend(command: str, dynamic_base_url: str) -> tuple[str, str]:
+    normalized = _normalize_command_text(command)
+
+    if not normalized:
+        return "custom", dynamic_base_url
+
+    if (
+        "ollama serve" in normalized
+        or "ollama.exe serve" in normalized
+        or (("ollama" in normalized or "ollama.exe" in normalized) and " serve" in f" {normalized}")
+    ):
+        return "ollama", "http://127.0.0.1:11434/v1"
+
+    if "llama_cpp.server" in normalized:
+        return "llama_cpp", dynamic_base_url
+
+    if "unsloth" in normalized:
+        return "unsloth", dynamic_base_url
+
+    return "custom", dynamic_base_url
 
 
 def _known_running_base_urls() -> list[str]:
@@ -164,30 +195,24 @@ def start_local_server() -> tuple[LocalServerHandle | None, str | None]:
         start_timeout = 45.0
 
     poll_interval = 0.4
+    failures: list[str] = []
 
     for template in candidates:
         if not template:
             continue
 
         command = template.format(host=host, port=port)
-        if "ollama serve" in command:
-            base_url = "http://127.0.0.1:11434/v1"
-            backend = "ollama"
-        elif "llama_cpp.server" in command:
-            base_url = dynamic_base_url
-            backend = "llama_cpp"
-        elif "unsloth" in command:
-            base_url = dynamic_base_url
-            backend = "unsloth"
-        else:
-            base_url = dynamic_base_url
-            backend = "custom"
+        backend, base_url = _classify_backend(command, dynamic_base_url)
 
         process = _start_process(command)
 
         deadline = time.time() + start_timeout
         while time.time() < deadline:
             if process.poll() is not None:
+                failures.append(
+                    f"{backend} command exited before becoming healthy: {command} "
+                    f"(exit code {process.returncode})"
+                )
                 break
             if _is_healthy(base_url):
                 os.environ["UNSLOTH_BASE_URL"] = base_url
@@ -200,6 +225,11 @@ def start_local_server() -> tuple[LocalServerHandle | None, str | None]:
                 ), None
             time.sleep(poll_interval)
 
+        if process.poll() is None:
+            failures.append(
+                f"{backend} command did not become healthy at {base_url} within {start_timeout:.0f}s: {command}"
+            )
+
         try:
             process.terminate()
             process.wait(timeout=3)
@@ -210,10 +240,11 @@ def start_local_server() -> tuple[LocalServerHandle | None, str | None]:
                 pass
 
     command_hint = command_template or " | ".join(_default_command_candidates())
+    details = f" Last failure: {failures[-1]}" if failures else ""
     return None, (
         "Could not start local inference server. "
         "Install and run one supported backend (Unsloth, llama-cpp-python, or Ollama), "
-        f"or set UNSLOTH_SERVER_COMMAND. Tried: {command_hint}"
+        f"or set UNSLOTH_SERVER_COMMAND. Tried: {command_hint}.{details}"
     )
 
 

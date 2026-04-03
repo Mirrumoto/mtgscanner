@@ -173,8 +173,9 @@ If you want local inference instead of Gemini, set the local endpoint variables 
 
 ## Unsloth + Ollama autodetect behavior
 
-- With `UNSLOTH_AUTOSTART=1` (default), the app attempts to auto-detect a healthy local Ollama endpoint at startup.
-- With `UNSLOTH_AUTOSTART=0`, startup autodetect is skipped, so set `UNSLOTH_BASE_URL` explicitly.
+- With `UNSLOTH_AUTOSTART=1` (default), the app first tries to auto-detect a healthy local Ollama endpoint at startup.
+- If nothing is already running and `UNSLOTH_SERVER_COMMAND` is set, the app will try to launch that command and wait for the endpoint to become healthy.
+- With `UNSLOTH_AUTOSTART=0`, startup autodetect/autostart is skipped, so set `UNSLOTH_BASE_URL` explicitly.
 
 ## Unsloth + Ollama setup (Windows)
 
@@ -185,7 +186,19 @@ Use this if you want local scanning with the app's `unsloth` provider while Olla
 - Install from https://ollama.com/download/windows
 - After install, open a new PowerShell window
 
-### 2) Start Ollama server
+### 2) Choose startup mode
+
+You can either let the app start Ollama for you, or start it yourself.
+
+Option A: let the app start Ollama automatically (recommended)
+
+```dotenv
+UNSLOTH_AUTOSTART=1
+UNSLOTH_API_KEY=unsloth-local
+UNSLOTH_SERVER_COMMAND=C:\path\to\Ollama\ollama.exe serve
+```
+
+Option B: start Ollama yourself
 
 Only do this if Ollama is not already running on your machine.
 
@@ -214,7 +227,7 @@ ollama pull gemma4:31b
 
 If you only want one to start, `gemma4:e4b` is a good default balance.
 
-### 4) Configure `.env`
+### 4) Configure `.env` for manual startup
 
 ```dotenv
 UNSLOTH_BASE_URL=http://127.0.0.1:11434/v1
@@ -236,7 +249,19 @@ UNSLOTH_AUTOSTART=0
 brew install --cask ollama
 ```
 
-### 2) Start Ollama server
+### 2) Choose startup mode
+
+You can either let the app start Ollama for you, or start it yourself.
+
+Option A: let the app start Ollama automatically (recommended)
+
+```dotenv
+UNSLOTH_AUTOSTART=1
+UNSLOTH_API_KEY=unsloth-local
+UNSLOTH_SERVER_COMMAND=ollama serve
+```
+
+Option B: start Ollama yourself
 
 Only do this if Ollama is not already running.
 
@@ -261,7 +286,7 @@ ollama pull gemma4:26b
 ollama pull gemma4:31b
 ```
 
-### 4) Configure `.env`
+### 4) Configure `.env` for manual startup
 
 ```dotenv
 UNSLOTH_BASE_URL=http://127.0.0.1:11434/v1

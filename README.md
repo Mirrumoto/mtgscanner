@@ -4,6 +4,8 @@ A desktop app for scanning Magic: The Gathering card photos into a usable collec
 
 You point it at a folder of card images, it identifies cards with a vision model, resolves printings through Scryfall, pulls pricing, and lets you validate everything before saving.
 
+> Note: the Windows EXE builder is currently not functional.
+
 ## What this app does
 
 - Scans card images (`.jpg`, `.jpeg`, `.png`, `.webp`), including images with multiple cards

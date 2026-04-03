@@ -338,14 +338,6 @@ Other useful local files:
 - MTGJSON cache/index: `%LOCALAPPDATA%\MTGBinderScanner\mtgjson`
 - Scryfall cache: `%LOCALAPPDATA%\MTGBinderScanner\scryfall_cache.json`
 
-The app now defaults Scryfall cache to `MTGBinderScanner` for consistency with other app files.
-
-If you want a custom location, set this in `.env`:
-
-```dotenv
-SCRYFALL_CACHE_PATH=%LOCALAPPDATA%\MTGBinderScanner\scryfall_cache.json
-```
-
 ## Optional: Run CLI scan
 
 You can also run the scanner without the GUI:

@@ -80,7 +80,7 @@ python3 app.py
 PowerShell:
 
 ```powershell
-cd C:\Users\wesle\.repos\mtgscanner
+cd C:\path\to\mtgscanner
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
@@ -139,7 +139,7 @@ brew install python
 Terminal (zsh):
 
 ```bash
-cd ~/repos/mtgscanner
+cd /path/to/mtgscanner
 python3 -m venv .venv
 source .venv/bin/activate
 ```

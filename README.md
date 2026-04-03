@@ -289,6 +289,11 @@ UNSLOTH_AUTOSTART=0
 - Review cards in the validation view
 - Save to a collection name
 
+## Example test images
+
+- This repo includes `examples.zip` in the project root.
+- Extract it and point the scanner to the extracted folder when you want quick sample input images.
+
 ## Image best practices
 
 - One image can contain one card or multiple cards.

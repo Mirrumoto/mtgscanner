@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 import vision
-import scryfall
+from pricing import PricingConfig, PricingService
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -278,8 +278,12 @@ def _create_backup_if_exists(file_path: Path, on_status=None, on_error=None) -> 
 def scan_with_callbacks(
     image_folder: str,
     output_path: str,
-    provider: str = "openai",
+    provider: str = "gemini",
     vision_model: str | None = None,
+    pricing_source: str = "mtgjson",
+    pricing_provider: str = "tcgplayer",
+    pricing_side: str = "retail",
+    pricing_fallback_to_scryfall: bool = True,
     on_card_identified=None,
     on_status=None,
     on_error=None,
@@ -316,6 +320,15 @@ def scan_with_callbacks(
 
     on_status(f"Found {len(images)} image(s). Starting scan…")
 
+    app_data_dir = Path(output_path).resolve().parent
+    pricing_service = PricingService(app_data_dir=app_data_dir)
+    pricing_config = PricingConfig(
+        source=pricing_source,
+        provider=pricing_provider,
+        side=pricing_side,
+        fallback_to_scryfall=pricing_fallback_to_scryfall,
+    )
+
     collection = _load_existing_collection(output_path, on_error=on_error) if append_existing else {}
     if collection:
         existing_total = sum(v.get("count", 0) for v in collection.values())
@@ -344,7 +357,7 @@ def scan_with_callbacks(
             continue
 
         for candidate in candidates:
-            resolved = scryfall.resolve(candidate)
+            resolved = pricing_service.resolve(candidate, pricing_config)
             if resolved:
                 resolved["finish"] = _apply_finish_policy(candidate, resolved)
                 resolved["name_confidence"] = candidate.get("name_confidence", candidate.get("confidence", "unknown"))
@@ -354,19 +367,15 @@ def scan_with_callbacks(
                 name = resolved.get("name", "?")
                 set_code = resolved.get("set", "?").upper()
                 number = resolved.get("collector_number", "?")
-                key = f"{name} [{set_code} #{number}]"
-                count = collection.get(key, {}).get("count", 1)
-                match_method = resolved.get("match_method", "unknown")
-                finish = collection.get(key, {}).get("finish", "unknown")
-                name_confidence = collection.get(key, {}).get("name_confidence", "unknown")
-                set_confidence = collection.get(key, {}).get("set_confidence", "unknown")
-                finish_confidence = collection.get(key, {}).get("finish_confidence", "unknown")
-                name = resolved.get("name", "?")
-                set_code = resolved.get("set", "?").upper()
-                number = resolved.get("collector_number", "?")
                 finish = resolved.get("finish", "unknown")
                 coll_key = f"{name} [{set_code} #{number}] ({finish})"
                 count = collection.get(coll_key, {}).get("count", 1)
+                name_confidence  = resolved.get("name_confidence", "unknown")
+                set_confidence   = resolved.get("set_confidence", "unknown")
+                finish_confidence = resolved.get("finish_confidence", "unknown")
+                on_status(
+                    f"      confidence: name={name_confidence}  set={set_confidence}  finish={finish_confidence}  [{finish}]"
+                )
                 on_card_identified(
                     name=name,
                     set_code=set_code,
@@ -387,6 +396,7 @@ def scan_with_callbacks(
                         "collector_number": str(resolved.get("collector_number", "")),
                         "rarity": resolved.get("rarity", "unknown"),
                         "prices": resolved.get("prices") if isinstance(resolved.get("prices"), dict) else {},
+                        "mtgjson_uuid": resolved.get("mtgjson_uuid"),
                         "finish": finish,
                         "image_url": _extract_image_url(resolved),
                         "match_method": resolved.get("match_method", "unknown"),

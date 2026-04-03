@@ -25,12 +25,19 @@ pyinstaller>=6.0.0
 
 ### 2. Set Up Your Environment Variables
 
-Before building, ensure your `.env` file is in the project root with your API keys:
+Before building, ensure your `.env` file is in the project root with your API keys and local server config:
 
 ```
-OPENAI_API_KEY=your-key-here
-GOOGLE_API_KEY=your-key-here
+GEMINI_API_KEY=your-key-here
+UNSLOTH_AUTOSTART=1
+# Optional; leave blank to auto-detect installed backends (unsloth, llama_cpp, ollama)
+UNSLOTH_SERVER_COMMAND=
 ```
+
+Notes:
+- `UNSLOTH_SERVER_COMMAND` is optional; set it only if you want to force a specific backend command.
+- The app picks a free local port at launch and sets `UNSLOTH_BASE_URL` dynamically.
+- If you already use a fixed hosted/local URL, set `UNSLOTH_BASE_URL=...` and keep `UNSLOTH_AUTOSTART_OVERRIDE_BASE_URL=0`.
 
 ### 3. Build the EXE
 
@@ -67,19 +74,25 @@ Copy-Item .env "C:\path\to\your\folder\.env"
 ```
 
 The EXE must be able to find your `.env` file in the same directory.
+When `UNSLOTH_AUTOSTART=1`, the app starts your local inference server at launch and stops it on exit.
 
 ### 5. Troubleshooting
 
 **"API key not found" error:**
 - Ensure `.env` is in the same directory as `MTGScanner.exe`
-- Make sure `OPENAI_API_KEY` and/or `GOOGLE_API_KEY` are set
+- Make sure `GEMINI_API_KEY` is set (if using Gemini)
+
+**"Could not start local inference server" error:**
+- Ensure `UNSLOTH_SERVER_COMMAND` is valid and runs successfully from PowerShell.
+- Ensure the server command launches an OpenAI-compatible API with a `/v1` base URL.
+- If running a fixed endpoint manually, set `UNSLOTH_BASE_URL` and disable autostart (`UNSLOTH_AUTOSTART=0`).
 
 **"Module not found" error:**
 - Rebuild with: `python build_exe.py`
 - Delete `build/` and `dist/` folders before rebuilding if issues persist
 
 **File size too large:**
-- The EXE is typically 100-200 MB due to bundled dependencies (OpenAI, Google, Pillow, etc.)
+- The EXE is typically 100-200 MB due to bundled dependencies (Google, Pillow, etc.)
 - This is normal and expected
 
 ## Creating a Shortcut

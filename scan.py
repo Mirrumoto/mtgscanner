@@ -11,29 +11,25 @@ Examples:
 
 import argparse
 import json
-import math
 import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-
-from PIL import Image
 
 import vision
 import scryfall
 
 # ── Supported image extensions ────────────────────────────────────────────────
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-BASE_IMAGE_TOKENS = 85
-HIGH_DETAIL_TILE_TOKENS = 170
-DEFAULT_INPUT_PER_1M = 2.50
-DEFAULT_OUTPUT_PER_1M = 10.00
-DEFAULT_OUTPUT_TOKENS_LOW = 200
-DEFAULT_OUTPUT_TOKENS_TYPICAL = 500
-DEFAULT_OUTPUT_TOKENS_HIGH = 900
 GEMINI_TIER_MODEL_MAP = {
     "2.5": "gemini-2.5-flash",
     "3": "gemini-3-flash-preview",
+}
+UNSLOTH_MODEL_MAP = {
+    "e2b": "gemma4:e2b",
+    "e4b": "gemma4:e4b",
+    "26b-a4b": "gemma4:26b",
+    "31b": "gemma4:31b",
 }
 
 
@@ -90,87 +86,6 @@ def _collect_images(folder: Path) -> list[Path]:
         if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
     )
     return images
-
-
-def _estimate_image_input_tokens(image_path: Path) -> int:
-    """
-    Estimate GPT-4o image input tokens for detail='high'.
-
-    Approximation follows OpenAI vision tile accounting:
-    1) Fit image in 2048x2048 box (preserve aspect ratio)
-    2) Scale so shortest side is 768
-    3) Count 512x512 tiles and apply token formula: 85 + 170 * tiles
-    """
-    with Image.open(image_path) as img:
-        width, height = img.size
-
-    if width <= 0 or height <= 0:
-        return BASE_IMAGE_TOKENS
-
-    scale_2048 = min(2048 / width, 2048 / height, 1.0)
-    width_2048 = width * scale_2048
-    height_2048 = height * scale_2048
-
-    shortest = min(width_2048, height_2048)
-    if shortest <= 0:
-        return BASE_IMAGE_TOKENS
-
-    scale_768 = 768 / shortest
-    width_final = width_2048 * scale_768
-    height_final = height_2048 * scale_768
-
-    tiles = math.ceil(width_final / 512) * math.ceil(height_final / 512)
-    return BASE_IMAGE_TOKENS + (HIGH_DETAIL_TILE_TOKENS * tiles)
-
-
-def _estimate_costs(
-    images: list[Path],
-    input_per_1m: float,
-    output_per_1m: float,
-) -> dict:
-    total_input_tokens = 0
-    for image_path in images:
-        total_input_tokens += _estimate_image_input_tokens(image_path)
-
-    count = len(images)
-    avg_input_tokens = (total_input_tokens / count) if count else 0
-
-    low_output_total = DEFAULT_OUTPUT_TOKENS_LOW * count
-    typical_output_total = DEFAULT_OUTPUT_TOKENS_TYPICAL * count
-    high_output_total = DEFAULT_OUTPUT_TOKENS_HIGH * count
-
-    def dollars(input_tokens: int, output_tokens: int) -> float:
-        return (input_tokens / 1_000_000) * input_per_1m + (output_tokens / 1_000_000) * output_per_1m
-
-    low_total = dollars(total_input_tokens, low_output_total)
-    typical_total = dollars(total_input_tokens, typical_output_total)
-    high_total = dollars(total_input_tokens, high_output_total)
-
-    return {
-        "images": count,
-        "total_input_tokens": total_input_tokens,
-        "avg_input_tokens": avg_input_tokens,
-        "low_total": low_total,
-        "typical_total": typical_total,
-        "high_total": high_total,
-        "low_per_image": low_total / count if count else 0,
-        "typical_per_image": typical_total / count if count else 0,
-        "high_per_image": high_total / count if count else 0,
-    }
-
-
-def _print_estimate(summary: dict, input_per_1m: float, output_per_1m: float) -> None:
-    print("─" * 60)
-    print("Cost estimate (rough)")
-    print(f"  Images                 : {summary['images']}")
-    print(f"  Avg image input tokens : {summary['avg_input_tokens']:.0f}")
-    print(f"  Total image input toks : {summary['total_input_tokens']}")
-    print(f"  Pricing used           : input ${input_per_1m:.2f}/1M, output ${output_per_1m:.2f}/1M")
-    print("  Output token assumptions per image: low=200, typical=500, high=900")
-    print(f"  Estimated per-image    : ${summary['low_per_image']:.4f} - ${summary['high_per_image']:.4f}")
-    print(f"  Estimated total        : ${summary['low_total']:.4f} - ${summary['high_total']:.4f}")
-    print(f"  Typical total          : ${summary['typical_total']:.4f}")
-    print("─" * 60)
 
 
 def _merge(collection: dict, card_data: dict) -> None:
@@ -347,11 +262,7 @@ def _create_backup_if_exists(file_path: Path) -> Path | None:
 def scan(
     image_folder: str,
     output_path: str | None = None,
-    approve: bool = False,
-    estimate_only: bool = False,
-    input_per_1m: float = DEFAULT_INPUT_PER_1M,
-    output_per_1m: float = DEFAULT_OUTPUT_PER_1M,
-    provider: str = "openai",
+    provider: str = "gemini",
     vision_model: str | None = None,
 ) -> None:
     folder = Path(image_folder)
@@ -363,19 +274,6 @@ def scan(
     if not images:
         print(f"No supported images found in '{image_folder}'.")
         sys.exit(0)
-
-    estimate = _estimate_costs(images, input_per_1m=input_per_1m, output_per_1m=output_per_1m)
-    _print_estimate(estimate, input_per_1m=input_per_1m, output_per_1m=output_per_1m)
-
-    if estimate_only:
-        print("Estimate-only mode enabled. No API calls were made.")
-        return
-
-    if not approve:
-        print("Approval required before paid API calls.")
-        print("Re-run with --approve to continue scanning.")
-        print("No API calls were made.")
-        return
 
     # Default output: cards.json next to the images
     if output_path is None:
@@ -416,6 +314,11 @@ def scan(
             if resolved:
                 resolved["finish"] = _apply_finish_policy(candidate, resolved)
                 _merge(collection, resolved)
+                name_c = candidate.get("name_confidence") or candidate.get("confidence") or "unknown"
+                set_c  = candidate.get("set_confidence")  or candidate.get("confidence") or "unknown"
+                fin_c  = candidate.get("finish_confidence") or candidate.get("confidence") or "unknown"
+                finish = resolved.get("finish", "unknown")
+                print(f"      confidence: name={name_c}  set={set_c}  finish={fin_c}  [{finish}]")
             else:
                 attempted_methods, failed_after = _unresolved_match_context(candidate)
                 unresolved.append({
@@ -468,31 +371,9 @@ def main() -> None:
         help="Path for the output JSON file. Defaults to cards.json inside the image folder.",
     )
     parser.add_argument(
-        "--approve",
-        action="store_true",
-        help="Proceed with paid vision calls after showing the estimate.",
-    )
-    parser.add_argument(
-        "--estimate-only",
-        action="store_true",
-        help="Show cost estimate and exit without any API calls.",
-    )
-    parser.add_argument(
-        "--input-per-1m",
-        type=float,
-        default=DEFAULT_INPUT_PER_1M,
-        help="Input token price per 1M tokens (default: 2.50).",
-    )
-    parser.add_argument(
-        "--output-per-1m",
-        type=float,
-        default=DEFAULT_OUTPUT_PER_1M,
-        help="Output token price per 1M tokens (default: 10.00).",
-    )
-    parser.add_argument(
         "--provider",
-        choices=["openai", "gemini"],
-        default="openai",
+        choices=["gemini", "unsloth"],
+        default="gemini",
         help="Vision provider to use for image identification.",
     )
     parser.add_argument(
@@ -506,22 +387,32 @@ def main() -> None:
         default=None,
         help="Gemini model preset shortcut (2.5 -> gemini-2.5-flash, 3 -> gemini-3-flash-preview).",
     )
+    parser.add_argument(
+        "--unsloth-tier",
+        choices=["e2b", "e4b", "26b-a4b", "31b"],
+        default=None,
+        help=(
+            "Unsloth/Gemma model preset shortcut "
+            "(e2b -> gemma4:e2b, e4b -> gemma4:e4b, "
+            "26b-a4b -> gemma4:26b, 31b -> gemma4:31b)."
+        ),
+    )
     args = parser.parse_args()
 
     selected_model = args.vision_model
     if args.provider == "gemini" and args.gemini_tier and not selected_model:
         selected_model = GEMINI_TIER_MODEL_MAP[args.gemini_tier]
+    if args.provider == "unsloth" and args.unsloth_tier and not selected_model:
+        selected_model = UNSLOTH_MODEL_MAP[args.unsloth_tier]
 
     if args.provider != "gemini" and args.gemini_tier:
         print("Note: --gemini-tier is ignored unless --provider gemini is used.")
+    if args.provider != "unsloth" and args.unsloth_tier:
+        print("Note: --unsloth-tier is ignored unless --provider unsloth is used.")
 
     scan(
         args.image_folder,
         args.output,
-        approve=args.approve,
-        estimate_only=args.estimate_only,
-        input_per_1m=args.input_per_1m,
-        output_per_1m=args.output_per_1m,
         provider=args.provider,
         vision_model=selected_model,
     )

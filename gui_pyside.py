@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+from dotenv import set_key
 from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
@@ -28,6 +29,7 @@ from PySide6.QtGui import QColor, QFontMetrics, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -60,15 +62,22 @@ from PySide6.QtWidgets import (
 )
 
 import scanner_engine
-import scryfall
+from pricing import PricingConfig, PricingService, price_from_prices_dict
 
 
 GEMINI_TIER_MODEL_MAP = {
     "2.5": "gemini-2.5-flash",
     "3": "gemini-3-flash-preview",
 }
+UNSLOTH_MODEL_MAP = {
+    "e2b": "gemma4:e2b",
+    "e4b": "gemma4:e4b",
+    "26b-a4b": "gemma4:26b",
+    "31b": "gemma4:31b",
+}
 
 NEW_COLLECTION_LABEL = "<New collection>"
+MAX_UUID_BACKFILL_PER_LOAD = 25
 
 
 class NumericTableItem(QTableWidgetItem):
@@ -250,6 +259,10 @@ class ScanWorker(QThread):
         output_path: str,
         provider: str,
         model: str | None,
+        pricing_source: str,
+        pricing_provider: str,
+        pricing_side: str,
+        pricing_fallback_to_scryfall: bool,
         cancel_event: threading.Event,
     ):
         super().__init__()
@@ -257,6 +270,10 @@ class ScanWorker(QThread):
         self.output_path = output_path
         self.provider = provider
         self.model = model
+        self.pricing_source = pricing_source
+        self.pricing_provider = pricing_provider
+        self.pricing_side = pricing_side
+        self.pricing_fallback_to_scryfall = pricing_fallback_to_scryfall
         self.cancel_event = cancel_event
 
     def run(self):
@@ -266,6 +283,10 @@ class ScanWorker(QThread):
                 output_path=self.output_path,
                 provider=self.provider,
                 vision_model=self.model,
+                pricing_source=self.pricing_source,
+                pricing_provider=self.pricing_provider,
+                pricing_side=self.pricing_side,
+                pricing_fallback_to_scryfall=self.pricing_fallback_to_scryfall,
                 on_card_identified=self._on_card,
                 on_status=self._on_status,
                 on_error=self._on_error,
@@ -335,6 +356,15 @@ class MainWindow(QMainWindow):
         self.collections_dir = self._resolve_collections_dir()
         self.thumb_cache_dir = self._resolve_thumbnail_cache_dir()
         self.log_file_path = self._resolve_log_file_path()
+        self.settings_path = self._resolve_settings_path()
+        self.settings = self._load_settings()
+        self.pricing_service = PricingService(app_data_dir=self.app_data_dir)
+        self.collection_pricing_config = PricingConfig(
+            source="mtgjson",
+            provider="tcgplayer",
+            side="retail",
+            fallback_to_scryfall=True,
+        )
 
         self._card_hover_filter = CardHoverFilter(self)
         self._status_mode = "idle"
@@ -343,9 +373,21 @@ class MainWindow(QMainWindow):
         self._status_timer.setInterval(420)
         self._status_timer.timeout.connect(self._animate_status_badge)
         self._fade_anims: list[QPropertyAnimation] = []
+        self._settings_toast_seq = 0
+        self._gemini_key_exists = False
 
         self._apply_styles()
         self._build_ui()
+        self._report_startup_state()
+
+    def _report_startup_state(self):
+        startup_info = str(os.environ.get("UNSLOTH_STARTUP_INFO") or "").strip()
+        startup_error = str(os.environ.get("UNSLOTH_STARTUP_ERROR") or "").strip()
+
+        if startup_info:
+            self._log(startup_info)
+        if startup_error:
+            self._log(startup_error, is_error=True)
 
     def _apply_styles(self):
         self.setStyleSheet(
@@ -485,6 +527,10 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.collection_tab, "Collection")
         self._build_collection_tab()
 
+        self.settings_tab = QWidget()
+        tabs.addTab(self.settings_tab, "Settings")
+        self._build_settings_tab()
+
         self.setCentralWidget(root)
 
     def _build_scanner_tab(self):
@@ -552,7 +598,7 @@ class MainWindow(QMainWindow):
 
         settings_layout.addWidget(QLabel("Provider"), 0, 0)
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["openai", "gemini"])
+        self.provider_combo.addItems(["gemini", "unsloth"])
         self.provider_combo.currentTextChanged.connect(self._update_model_combo)
         settings_layout.addWidget(self.provider_combo, 0, 1)
 
@@ -658,6 +704,9 @@ class MainWindow(QMainWindow):
         content_row.addWidget(left_panel, 2)
         content_row.addWidget(right_panel, 8)
 
+        saved_provider = str(self.settings.get("vision_provider") or "gemini")
+        provider_index = self.provider_combo.findText(saved_provider)
+        self.provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
         self._update_model_combo()
 
         layout.addWidget(top_bar)
@@ -703,6 +752,38 @@ class MainWindow(QMainWindow):
         delete_collection_btn.setObjectName("GhostButton")
         delete_collection_btn.clicked.connect(self._delete_current_collection)
         left_layout.addWidget(delete_collection_btn)
+
+        pricing_separator = QFrame()
+        pricing_separator.setFrameShape(QFrame.HLine)
+        pricing_separator.setFrameShadow(QFrame.Sunken)
+        left_layout.addWidget(pricing_separator)
+
+        pricing_label = QLabel("Collection Pricing")
+        pricing_label.setObjectName("FieldLabel")
+        left_layout.addWidget(pricing_label)
+
+        self.collection_pricing_source_combo = QComboBox()
+        self.collection_pricing_source_combo.addItem("MTGJSON", "mtgjson")
+        self.collection_pricing_source_combo.addItem("Scryfall", "scryfall")
+        left_layout.addWidget(self.collection_pricing_source_combo)
+
+        self.collection_pricing_provider_combo = QComboBox()
+        self.collection_pricing_provider_combo.addItem("TCGplayer", "tcgplayer")
+        self.collection_pricing_provider_combo.addItem("Card Kingdom", "cardkingdom")
+        self.collection_pricing_provider_combo.addItem("Cardsphere", "cardsphere")
+        self.collection_pricing_provider_combo.addItem("Cardmarket", "cardmarket")
+        left_layout.addWidget(self.collection_pricing_provider_combo)
+
+        self.collection_pricing_side_combo = QComboBox()
+        self.collection_pricing_side_combo.addItem("Retail", "retail")
+        self.collection_pricing_side_combo.addItem("Buylist", "buylist")
+        left_layout.addWidget(self.collection_pricing_side_combo)
+
+        self.collection_pricing_source_combo.currentIndexChanged.connect(self._on_collection_pricing_changed)
+        self.collection_pricing_provider_combo.currentIndexChanged.connect(self._on_collection_pricing_changed)
+        self.collection_pricing_side_combo.currentIndexChanged.connect(self._on_collection_pricing_changed)
+        self.collection_pricing_config = self._scan_default_pricing_config()
+        self._apply_collection_pricing_controls(self.collection_pricing_config)
 
         self.list_toggle = QPushButton("☰ List")
         self.grid_toggle = QPushButton("▦ Grid")
@@ -797,6 +878,105 @@ class MainWindow(QMainWindow):
         self.table.set_hover_callbacks(get_card_at_index, self._get_card_pixmap)
         self.grid_list.set_hover_callbacks(get_card_at_index, self._get_card_pixmap)
 
+    def _build_settings_tab(self):
+        layout = QVBoxLayout(self.settings_tab)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(12)
+
+        panel = QFrame()
+        panel.setObjectName("Card")
+        self._attach_card_effect(panel)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 14, 14, 14)
+        panel_layout.setSpacing(12)
+
+        title = QLabel("Application Settings")
+        title.setObjectName("SectionTitle")
+        panel_layout.addWidget(title)
+
+        subtitle = QLabel("These values are saved to settings.json and pre-filled on startup.")
+        subtitle.setObjectName("SummaryLabel")
+        panel_layout.addWidget(subtitle)
+
+        form_card = QFrame()
+        form_card.setObjectName("Card")
+        form_layout = QGridLayout(form_card)
+        form_layout.setContentsMargins(12, 12, 12, 12)
+        form_layout.setHorizontalSpacing(10)
+        form_layout.setVerticalSpacing(10)
+
+        form_layout.addWidget(QLabel("Vision Provider"), 0, 0)
+        self.settings_provider_combo = QComboBox()
+        self.settings_provider_combo.addItems(["gemini", "unsloth"])
+        self.settings_provider_combo.currentTextChanged.connect(self._update_settings_model_combo)
+        form_layout.addWidget(self.settings_provider_combo, 0, 1)
+
+        form_layout.addWidget(QLabel("Vision Model"), 1, 0)
+        self.settings_model_combo = QComboBox()
+        form_layout.addWidget(self.settings_model_combo, 1, 1)
+
+        form_layout.addWidget(QLabel("Gemini API Key"), 2, 0)
+        self.settings_gemini_key_edit = QLineEdit()
+        self.settings_gemini_key_edit.setEchoMode(QLineEdit.Password)
+        self.settings_gemini_key_edit.setPlaceholderText("Paste Gemini API key")
+        form_layout.addWidget(self.settings_gemini_key_edit, 2, 1)
+
+        form_layout.addWidget(QLabel("Unsloth Base URL"), 3, 0)
+        self.settings_unsloth_base_url_edit = QLineEdit()
+        self.settings_unsloth_base_url_edit.setPlaceholderText("http://127.0.0.1:8080/v1")
+        form_layout.addWidget(self.settings_unsloth_base_url_edit, 3, 1)
+
+        form_layout.addWidget(QLabel("Default Scan Pricing Source"), 4, 0)
+        self.settings_scan_pricing_source_combo = QComboBox()
+        self.settings_scan_pricing_source_combo.addItem("MTGJSON", "mtgjson")
+        self.settings_scan_pricing_source_combo.addItem("Scryfall", "scryfall")
+        form_layout.addWidget(self.settings_scan_pricing_source_combo, 4, 1)
+
+        form_layout.addWidget(QLabel("Default Scan Pricing Provider"), 5, 0)
+        self.settings_scan_pricing_provider_combo = QComboBox()
+        self.settings_scan_pricing_provider_combo.addItem("TCGplayer", "tcgplayer")
+        self.settings_scan_pricing_provider_combo.addItem("Card Kingdom", "cardkingdom")
+        self.settings_scan_pricing_provider_combo.addItem("Cardsphere", "cardsphere")
+        self.settings_scan_pricing_provider_combo.addItem("Cardmarket", "cardmarket")
+        form_layout.addWidget(self.settings_scan_pricing_provider_combo, 5, 1)
+
+        form_layout.addWidget(QLabel("Default Scan Pricing Side"), 6, 0)
+        self.settings_scan_pricing_side_combo = QComboBox()
+        self.settings_scan_pricing_side_combo.addItem("Retail", "retail")
+        self.settings_scan_pricing_side_combo.addItem("Buylist", "buylist")
+        form_layout.addWidget(self.settings_scan_pricing_side_combo, 6, 1)
+
+        self.settings_pricing_fallback_check = QCheckBox(
+            "Fallback to Scryfall when MTGJSON pricing is unavailable"
+        )
+        form_layout.addWidget(self.settings_pricing_fallback_check, 7, 0, 1, 2)
+
+        panel_layout.addWidget(form_card)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        reload_btn = QPushButton("↺ Reload")
+        reload_btn.setObjectName("GhostButton")
+        reload_btn.clicked.connect(self._load_settings_tab_controls)
+
+        save_btn = QPushButton("💾 Save Settings")
+        save_btn.setObjectName("PrimaryButton")
+        save_btn.clicked.connect(self._save_settings_from_tab)
+
+        actions.addWidget(reload_btn)
+        actions.addWidget(save_btn)
+        panel_layout.addLayout(actions)
+
+        self.settings_toast_label = QLabel("")
+        self.settings_toast_label.setObjectName("StatusBadge")
+        self.settings_toast_label.setVisible(False)
+        panel_layout.addWidget(self.settings_toast_label, 0, Qt.AlignRight)
+
+        layout.addWidget(panel)
+        layout.addStretch(1)
+
+        self._load_settings_tab_controls()
+
 
 
 
@@ -879,6 +1059,388 @@ class MainWindow(QMainWindow):
     def _resolve_log_file_path(self) -> Path:
         return self.app_data_dir / "scanner.log"
 
+    def _resolve_settings_path(self) -> Path:
+        return self.app_data_dir / "settings.json"
+
+    def _default_settings(self) -> dict:
+        return {
+            "vision_provider": "gemini",
+            "vision_model": "gemini-2.5-flash",
+            "unsloth_base_url": "http://127.0.0.1:8080/v1",
+            "scan_pricing_source": "mtgjson",
+            "scan_pricing_provider": "tcgplayer",
+            "scan_pricing_side": "retail",
+            "pricing_fallback_to_scryfall": True,
+            "collection_pricing_overrides": {},
+        }
+
+    def _load_settings(self) -> dict:
+        settings = self._default_settings()
+        if not self.settings_path.exists():
+            return settings
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                settings.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            return settings
+        return settings
+
+    def _save_settings(self) -> None:
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as handle:
+                json.dump(self.settings, handle, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _scan_default_pricing_config(self) -> PricingConfig:
+        return PricingConfig(
+            source=str(self.settings.get("scan_pricing_source") or "mtgjson").strip().lower(),
+            provider=str(self.settings.get("scan_pricing_provider") or "tcgplayer").strip().lower(),
+            side=str(self.settings.get("scan_pricing_side") or "retail").strip().lower(),
+            fallback_to_scryfall=bool(self.settings.get("pricing_fallback_to_scryfall", True)),
+        )
+
+    def _populate_model_combo_for_provider(self, combo: QComboBox, provider: str, desired_model: str = ""):
+        combo.blockSignals(True)
+        combo.clear()
+
+        if provider == "gemini":
+            combo.addItems(["2.5 (gemini-2.5-flash)", "3 (gemini-3-flash-preview)"])
+            desired_label = ""
+            if "2.5" in desired_model:
+                desired_label = "2.5 (gemini-2.5-flash)"
+            elif "3" in desired_model:
+                desired_label = "3 (gemini-3-flash-preview)"
+            index = combo.findText(desired_label)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        else:
+            combo.addItems([
+                "E2B (gemma4:e2b)",
+                "E4B (gemma4:e4b)",
+                "26B-A4B (gemma4:26b)",
+                "31B (gemma4:31b)",
+            ])
+            desired_label = ""
+            if desired_model == UNSLOTH_MODEL_MAP["e2b"]:
+                desired_label = "E2B (gemma4:e2b)"
+            elif desired_model in {UNSLOTH_MODEL_MAP["e4b"], "gemma4:latest", "gemma-4-e4b-it"}:
+                desired_label = "E4B (gemma4:e4b)"
+            elif desired_model == UNSLOTH_MODEL_MAP["26b-a4b"]:
+                desired_label = "26B-A4B (gemma4:26b)"
+            elif desired_model == UNSLOTH_MODEL_MAP["31b"]:
+                desired_label = "31B (gemma4:31b)"
+            index = combo.findText(desired_label)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+
+        combo.blockSignals(False)
+
+    def _model_from_combo_selection(self, provider: str, selected: str) -> str | None:
+        if provider == "gemini":
+            if "2.5" in selected:
+                return GEMINI_TIER_MODEL_MAP["2.5"]
+            return GEMINI_TIER_MODEL_MAP["3"]
+
+        selected_lower = selected.lower()
+        if "e2b" in selected_lower:
+            return UNSLOTH_MODEL_MAP["e2b"]
+        if "26b-a4b" in selected_lower:
+            return UNSLOTH_MODEL_MAP["26b-a4b"]
+        if "31b" in selected_lower:
+            return UNSLOTH_MODEL_MAP["31b"]
+        return UNSLOTH_MODEL_MAP["e4b"]
+
+    def _update_settings_model_combo(self):
+        if not hasattr(self, "settings_provider_combo"):
+            return
+        provider = self.settings_provider_combo.currentText()
+        desired_model = str(self.settings.get("vision_model") or "")
+        self._populate_model_combo_for_provider(self.settings_model_combo, provider, desired_model)
+
+    def _load_settings_tab_controls(self):
+        if not hasattr(self, "settings_provider_combo"):
+            return
+
+        provider = str(self.settings.get("vision_provider") or "gemini")
+        provider_index = self.settings_provider_combo.findText(provider)
+        self.settings_provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
+        self._update_settings_model_combo()
+
+        desired_model = str(self.settings.get("vision_model") or "")
+        self._populate_model_combo_for_provider(
+            self.settings_model_combo,
+            self.settings_provider_combo.currentText(),
+            desired_model,
+        )
+
+        existing_key = self._existing_gemini_api_key()
+        self._gemini_key_exists = bool(existing_key)
+        self.settings_gemini_key_edit.clear()
+        if self._gemini_key_exists:
+            self.settings_gemini_key_edit.setPlaceholderText("•••••••••••• (saved)")
+        else:
+            self.settings_gemini_key_edit.setPlaceholderText("Paste Gemini API key")
+
+        self.settings_unsloth_base_url_edit.setText(str(self.settings.get("unsloth_base_url") or ""))
+        self.settings_pricing_fallback_check.setChecked(
+            bool(self.settings.get("pricing_fallback_to_scryfall", True))
+        )
+
+        source = str(self.settings.get("scan_pricing_source") or "mtgjson").strip().lower()
+        source_index = self.settings_scan_pricing_source_combo.findData(source)
+        self.settings_scan_pricing_source_combo.setCurrentIndex(source_index if source_index >= 0 else 0)
+
+        provider_value = str(self.settings.get("scan_pricing_provider") or "tcgplayer").strip().lower()
+        provider_idx = self.settings_scan_pricing_provider_combo.findData(provider_value)
+        self.settings_scan_pricing_provider_combo.setCurrentIndex(provider_idx if provider_idx >= 0 else 0)
+
+        side = str(self.settings.get("scan_pricing_side") or "retail").strip().lower()
+        side_index = self.settings_scan_pricing_side_combo.findData(side)
+        self.settings_scan_pricing_side_combo.setCurrentIndex(side_index if side_index >= 0 else 0)
+
+    def _save_settings_from_tab(self):
+        if not hasattr(self, "settings_provider_combo"):
+            return
+
+        provider = self.settings_provider_combo.currentText()
+        model = self._model_from_combo_selection(provider, self.settings_model_combo.currentText())
+
+        self.settings["vision_provider"] = provider
+        self.settings["vision_model"] = model or ""
+        self.settings["unsloth_base_url"] = self.settings_unsloth_base_url_edit.text().strip()
+        self.settings["scan_pricing_source"] = self.settings_scan_pricing_source_combo.currentData() or "mtgjson"
+        self.settings["scan_pricing_provider"] = self.settings_scan_pricing_provider_combo.currentData() or "tcgplayer"
+        self.settings["scan_pricing_side"] = self.settings_scan_pricing_side_combo.currentData() or "retail"
+        self.settings["pricing_fallback_to_scryfall"] = self.settings_pricing_fallback_check.isChecked()
+
+        new_gemini_key = self.settings_gemini_key_edit.text().strip()
+        if new_gemini_key:
+            if not self._persist_gemini_api_key(new_gemini_key):
+                self._show_settings_toast("Failed to save Gemini API key", is_error=True)
+                return
+            os.environ["GEMINI_API_KEY"] = new_gemini_key
+            self._gemini_key_exists = True
+            self.settings_gemini_key_edit.clear()
+            self.settings_gemini_key_edit.setPlaceholderText("•••••••••••• (saved)")
+
+        self._save_settings()
+
+        unsloth_base_url = str(self.settings.get("unsloth_base_url") or "").strip()
+        if unsloth_base_url:
+            os.environ["UNSLOTH_BASE_URL"] = unsloth_base_url
+
+        scanner_provider_index = self.provider_combo.findText(provider)
+        self.provider_combo.setCurrentIndex(scanner_provider_index if scanner_provider_index >= 0 else 0)
+        self._update_model_combo()
+
+        if self.current_collection_path:
+            self.collection_pricing_config = self._load_collection_pricing_for_path(self.current_collection_path)
+            self._apply_collection_pricing_controls(self.collection_pricing_config)
+            if self.collection_rows:
+                self._refresh_collection_prices_for_current_config()
+
+        self._show_settings_toast("Settings saved")
+
+    def _show_settings_toast(self, message: str, is_error: bool = False):
+        if not hasattr(self, "settings_toast_label"):
+            return
+
+        self._settings_toast_seq += 1
+        seq = self._settings_toast_seq
+
+        if is_error:
+            style = (
+                "background-color: #4a1f26; border: 1px solid #a74555; border-radius: 10px; "
+                "padding: 5px 10px; font-weight: 600; color: #ffdce2;"
+            )
+        else:
+            style = (
+                "background-color: #1f4a33; border: 1px solid #2f7d56; border-radius: 10px; "
+                "padding: 5px 10px; font-weight: 600; color: #dfffea;"
+            )
+
+        self.settings_toast_label.setStyleSheet(style)
+        self.settings_toast_label.setText(message)
+        self.settings_toast_label.setVisible(True)
+
+        QTimer.singleShot(1800, lambda: self._hide_settings_toast(seq))
+
+    def _hide_settings_toast(self, seq: int):
+        if seq != self._settings_toast_seq:
+            return
+        if hasattr(self, "settings_toast_label"):
+            self.settings_toast_label.setVisible(False)
+
+    def _resolve_env_path_for_write(self) -> Path:
+        here = Path(__file__).resolve().parent
+        candidates = [
+            Path.cwd() / ".env",
+            here / ".env",
+        ]
+        for env_path in candidates:
+            if env_path.exists() and env_path.is_file():
+                return env_path
+        return Path.cwd() / ".env"
+
+    def _read_key_from_env_file(self, key_name: str) -> str:
+        env_path = self._resolve_env_path_for_write()
+        if not env_path.exists() or not env_path.is_file():
+            return ""
+        try:
+            with open(env_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#") or "=" not in stripped:
+                        continue
+                    name, value = stripped.split("=", 1)
+                    if name.strip() != key_name:
+                        continue
+                    cleaned = value.strip().strip('"').strip("'")
+                    return cleaned
+        except OSError:
+            return ""
+        return ""
+
+    def _existing_gemini_api_key(self) -> str:
+        env_value = str(os.environ.get("GEMINI_API_KEY") or "").strip()
+        if env_value:
+            return env_value
+        return self._read_key_from_env_file("GEMINI_API_KEY")
+
+    def _persist_gemini_api_key(self, api_key: str) -> bool:
+        env_path = self._resolve_env_path_for_write()
+        try:
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            if not env_path.exists():
+                env_path.touch()
+            set_key(str(env_path), "GEMINI_API_KEY", api_key)
+            return True
+        except Exception:
+            return False
+
+    def _current_collection_pricing_config(self) -> PricingConfig:
+        return self.collection_pricing_config
+
+    def _load_collection_pricing_for_path(self, collection_path: Path | None) -> PricingConfig:
+        fallback = self._scan_default_pricing_config()
+        if collection_path is None:
+            return fallback
+
+        overrides = self.settings.get("collection_pricing_overrides", {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+
+        raw = overrides.get(str(collection_path), {})
+        if not isinstance(raw, dict):
+            raw = {}
+
+        return PricingConfig(
+            source=str(raw.get("source") or fallback.source).strip().lower(),
+            provider=str(raw.get("provider") or fallback.provider).strip().lower(),
+            side=str(raw.get("side") or fallback.side).strip().lower(),
+            fallback_to_scryfall=bool(self.settings.get("pricing_fallback_to_scryfall", True)),
+        )
+
+    def _persist_current_collection_pricing(self):
+        if not self.current_collection_path:
+            return
+        overrides = self.settings.get("collection_pricing_overrides")
+        if not isinstance(overrides, dict):
+            overrides = {}
+
+        cfg = self._current_collection_pricing_config()
+        overrides[str(self.current_collection_path)] = {
+            "source": cfg.source,
+            "provider": cfg.provider,
+            "side": cfg.side,
+        }
+        self.settings["collection_pricing_overrides"] = overrides
+        self._save_settings()
+
+    def _apply_collection_pricing_controls(self, cfg: PricingConfig):
+        if not hasattr(self, "collection_pricing_source_combo"):
+            return
+        self.collection_pricing_source_combo.blockSignals(True)
+        self.collection_pricing_provider_combo.blockSignals(True)
+        self.collection_pricing_side_combo.blockSignals(True)
+
+        source_index = self.collection_pricing_source_combo.findData(cfg.source)
+        self.collection_pricing_source_combo.setCurrentIndex(source_index if source_index >= 0 else 0)
+
+        provider_index = self.collection_pricing_provider_combo.findData(cfg.provider)
+        self.collection_pricing_provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
+
+        side_index = self.collection_pricing_side_combo.findData(cfg.side)
+        self.collection_pricing_side_combo.setCurrentIndex(side_index if side_index >= 0 else 0)
+
+        self.collection_pricing_source_combo.blockSignals(False)
+        self.collection_pricing_provider_combo.blockSignals(False)
+        self.collection_pricing_side_combo.blockSignals(False)
+
+    def _on_collection_pricing_changed(self):
+        if not self.current_collection_path:
+            return
+
+        self.collection_pricing_config = PricingConfig(
+            source=self.collection_pricing_source_combo.currentData() or "mtgjson",
+            provider=self.collection_pricing_provider_combo.currentData() or "tcgplayer",
+            side=self.collection_pricing_side_combo.currentData() or "retail",
+            fallback_to_scryfall=bool(self.settings.get("pricing_fallback_to_scryfall", True)),
+        )
+        self._persist_current_collection_pricing()
+        self._print_options_cache.clear()
+        self._refresh_collection_prices_for_current_config()
+
+    def _refresh_collection_prices_for_current_config(self):
+        if not self.current_collection_path or not self.collection_rows:
+            return
+
+        cfg = self._current_collection_pricing_config()
+        total_copies = 0
+
+        self._log(
+            f"Repricing collection using source={cfg.source}, provider={cfg.provider}, side={cfg.side}"
+        )
+
+        for row in self.collection_rows:
+            finish_raw = self._finish_raw(row.get("finish_raw") or row.get("finish"))
+            prices, price_value, mtgjson_uuid = self.pricing_service.get_price_for_print(
+                name=str(row.get("name") or ""),
+                set_code=str(row.get("set_code") or ""),
+                collector_number=str(row.get("collector_number") or ""),
+                finish=finish_raw,
+                config=cfg,
+                scryfall_id=str(row.get("scryfall_id") or "") or None,
+            )
+            row["finish_raw"] = finish_raw
+            row["prices"] = prices
+            row["price_value"] = float(price_value)
+            row["price_str"] = f"${float(price_value):.2f}"
+            if mtgjson_uuid:
+                row["mtgjson_uuid"] = mtgjson_uuid
+
+            try:
+                total_copies += int(row.get("count", 1) or 1)
+            except (TypeError, ValueError):
+                total_copies += 1
+
+        self.collection_rows = sorted(self.collection_rows, key=lambda r: r.get("price_value", 0.0), reverse=True)
+        self._render_table()
+        self._render_grid()
+
+        total_value = 0.0
+        for row in self.collection_rows:
+            try:
+                count = int(row.get("count", 1) or 1)
+            except (TypeError, ValueError):
+                count = 1
+            total_value += float(row.get("price_value", 0.0) or 0.0) * count
+        self.total_value_label.setText(f"${total_value:.2f}")
+        self.summary_label.setText(f"Unique Cards: {len(self.collection_rows)} | Total Copies: {total_copies}")
+
+        self._save_collection_to_file()
+
     def _resolve_app_data_dir(self) -> Path:
         if os.name == "nt":
             base_dir = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
@@ -947,17 +1509,48 @@ class MainWindow(QMainWindow):
         self.validation_count_label.setText(f"{len(self.validation_rows)} pending")
 
     def _options_for_name(self, card_name: str) -> list[dict]:
-        key = card_name.strip().lower()
+        cfg = self._current_collection_pricing_config()
+        key = f"{card_name.strip().lower()}|{cfg.source}|{cfg.provider}|{cfg.side}|{int(cfg.fallback_to_scryfall)}"
         cached = self._print_options_cache.get(key)
         if cached is not None:
             return cached
 
-        options = scryfall.get_print_options(card_name)
+        options = self.pricing_service.get_print_options(card_name, cfg)
         self._print_options_cache[key] = options
         return options
 
+    def _scan_options_for_name(self, card_name: str) -> list[dict]:
+        cfg = self._scan_default_pricing_config()
+        key = f"scan|{card_name.strip().lower()}|{cfg.source}|{cfg.provider}|{cfg.side}|{int(cfg.fallback_to_scryfall)}"
+        cached = self._print_options_cache.get(key)
+        if cached is not None:
+            return cached
+
+        options = self.pricing_service.get_print_options(card_name, cfg)
+        self._print_options_cache[key] = options
+        return options
+
+    def _should_prefetch_validation_options(self, detection: dict) -> bool:
+        match_method = str(detection.get("match_method") or "").strip().lower()
+        name_confidence = str(detection.get("name_confidence") or "unknown").strip().lower()
+        set_confidence = str(detection.get("set_confidence") or "unknown").strip().lower()
+        set_code = str(detection.get("set") or "").strip()
+        collector_number = str(detection.get("collector_number") or "").strip()
+
+        if not set_code or not collector_number:
+            return True
+        if match_method != "set+number":
+            return True
+        if name_confidence not in {"high", "medium"}:
+            return True
+        if set_confidence != "high":
+            return True
+        return False
+
     def _create_validation_row(self, detection: dict) -> dict:
-        options = self._options_for_name(detection.get("name", ""))
+        options: list[dict] = []
+        if self._should_prefetch_validation_options(detection):
+            options = self._scan_options_for_name(detection.get("name", ""))
         if not options:
             options = [
                 {
@@ -967,6 +1560,7 @@ class MainWindow(QMainWindow):
                     "collector_number": str(detection.get("collector_number", "")),
                     "rarity": detection.get("rarity", "unknown"),
                     "prices": detection.get("prices", {}),
+                    "mtgjson_uuid": detection.get("mtgjson_uuid"),
                     "finish": str(detection.get("finish", "unknown")).lower(),
                     "image_url": str(detection.get("image_url", "")),
                 }
@@ -1190,6 +1784,7 @@ class MainWindow(QMainWindow):
                 "collector_number": collector_number,
                 "rarity": selected.get("rarity", existing_entry.get("rarity", "unknown")),
                 "prices": selected.get("prices", existing_entry.get("prices", {})),
+                "mtgjson_uuid": selected.get("mtgjson_uuid", existing_entry.get("mtgjson_uuid")),
                 "finish": finish,
                 "image_uris": {"small": selected.get("image_url", "")},
                 "count": existing_count + 1,
@@ -1255,6 +1850,8 @@ class MainWindow(QMainWindow):
             return "background-color: #5f3ac7; color: #f4ebff;"
         if normalized == "nonfoil":
             return "background-color: #1f6a50; color: #defee8;"
+        if normalized == "etched":
+            return "background-color: #7a5b2f; color: #fff4dc;"
         return "background-color: #4b5563; color: #edf2f7;"
 
     def _add_live_detection_card(
@@ -1451,6 +2048,8 @@ class MainWindow(QMainWindow):
     def _load_collection_by_path(self, path: Path):
         """Load a collection file by path."""
         self.current_collection_path = path
+        self.collection_pricing_config = self._load_collection_pricing_for_path(path)
+        self._apply_collection_pricing_controls(self.collection_pricing_config)
         self._load_collection()
 
     def _delete_current_collection(self):
@@ -1585,9 +2184,9 @@ class MainWindow(QMainWindow):
         finish_layout = QHBoxLayout()
         finish_label = QLabel("Finish:")
         finish_combo = QComboBox()
-        finish_combo.addItems(["Non-foil", "Foil"])
-        finish_text = card.get('finish', 'Non-foil')
-        if finish_text in ["Non-foil", "Foil"]:
+        finish_combo.addItems(["Non-foil", "Foil", "Etched", "Unknown"])
+        finish_text = card.get('finish', 'Unknown')
+        if finish_text in ["Non-foil", "Foil", "Etched", "Unknown"]:
             finish_combo.setCurrentText(finish_text)
         finish_layout.addWidget(finish_label, 1)
         finish_layout.addWidget(finish_combo, 3)
@@ -1686,7 +2285,10 @@ class MainWindow(QMainWindow):
             card['set_code'] = set_combo.currentText()
             card['collector_number'] = number_combo.currentText()
             card['rarity'] = rarity_combo.currentText()
-            card['finish'] = finish_combo.currentText()
+            selected_finish_text = finish_combo.currentText()
+            selected_finish_raw = self._finish_raw(selected_finish_text)
+            card['finish_raw'] = selected_finish_raw
+            card['finish'] = self._finish_display(selected_finish_raw)
             
             # Update price data from the selected print option
             selected_set = set_combo.currentText()
@@ -1698,19 +2300,21 @@ class MainWindow(QMainWindow):
             for opt in print_options:
                 if (opt.get('set') == selected_set and 
                     opt.get('collector_number') == selected_number and 
-                    opt.get('rarity') == selected_rarity):
+                    opt.get('rarity') == selected_rarity and
+                    self._finish_raw(opt.get('finish', 'unknown')) == selected_finish_raw):
                     matched_option = opt
                     break
             
             # Update prices if we found a matching option with valid price data
             if matched_option:
                 new_prices = matched_option.get('prices', {})
-                # Only update if we have actual price data
-                if isinstance(new_prices, dict) and new_prices.get('usd'):
+                if isinstance(new_prices, dict):
                     card['prices'] = new_prices
-                    price_usd = self._coerce_price(new_prices.get('usd'))
+                    price_usd = price_from_prices_dict(new_prices, selected_finish_raw)
                     card['price_value'] = price_usd
                     card['price_str'] = f"${price_usd:.2f}"
+                if matched_option.get('mtgjson_uuid'):
+                    card['mtgjson_uuid'] = matched_option.get('mtgjson_uuid')
                 
                 # Update image if available
                 if matched_option.get('image_url'):
@@ -1774,16 +2378,18 @@ class MainWindow(QMainWindow):
             collection_dict = {}
             for row in self.collection_rows:
                 # Use card name as key if no unique key exists
-                key = f"{row['name']}_{row['set_code']}_{row['collector_number']}_{row['finish']}"
+                finish_raw = self._finish_raw(row.get("finish_raw") or row.get("finish"))
+                key = f"{row['name']}_{row['set_code']}_{row['collector_number']}_{finish_raw}"
                 collection_dict[key] = {
                     "name": row["name"],
                     "count": row["count"],
-                    "set": row["set_code"],
+                    "set": str(row["set_code"]).lower(),
                     "set_name": row.get("set_name", ""),
                     "collector_number": row["collector_number"],
                     "rarity": row["rarity"],
-                    "finish": row["finish"],
-                    "prices": {"usd": row.get("price_value", 0.0)},
+                    "finish": finish_raw,
+                    "prices": row.get("prices", {"usd": row.get("price_value", 0.0)}),
+                    "mtgjson_uuid": row.get("mtgjson_uuid"),
                     "price_str": row["price_str"],
                     "image_uris": {"small": row.get("image_url", "")},
                 }
@@ -1792,8 +2398,15 @@ class MainWindow(QMainWindow):
                 json.dump(dict(sorted(collection_dict.items())), handle, indent=2, ensure_ascii=False)
             
             # Recalculate totals
-            total_value = sum(row["price_value"] for row in self.collection_rows)
-            total_copies = sum(row["count"] for row in self.collection_rows)
+            total_value = 0.0
+            total_copies = 0
+            for row in self.collection_rows:
+                try:
+                    count = int(row.get("count", 1) or 1)
+                except (TypeError, ValueError):
+                    count = 1
+                total_copies += count
+                total_value += float(row.get("price_value", 0.0) or 0.0) * count
             self.total_value_label.setText(f"${total_value:.2f}")
             self.summary_label.setText(f"Unique Cards: {len(self.collection_rows)} | Total Copies: {total_copies}")
             
@@ -1802,27 +2415,25 @@ class MainWindow(QMainWindow):
 
     def _update_model_combo(self):
         provider = self.provider_combo.currentText()
-        self.model_combo.blockSignals(True)
-        self.model_combo.clear()
-        if provider == "openai":
-            self.model_combo.addItems(["gpt-4o", "gpt-4o-mini"])
-        else:
-            self.model_combo.addItems(["2.5 (gemini-2.5-flash)", "3 (gemini-3-flash-preview)"])
-        self.model_combo.setCurrentIndex(0)
-        self.model_combo.blockSignals(False)
+        self.settings["vision_provider"] = provider
+        desired_model = str(self.settings.get("vision_model") or "")
+        self._populate_model_combo_for_provider(self.model_combo, provider, desired_model)
+        self.settings["vision_model"] = self._selected_model() or ""
+        self._save_settings()
 
     def _selected_model(self) -> str | None:
         provider = self.provider_combo.currentText()
         selected = self.model_combo.currentText()
-        if provider == "openai":
-            return selected
-        if "2.5" in selected:
-            return GEMINI_TIER_MODEL_MAP["2.5"]
-        return GEMINI_TIER_MODEL_MAP["3"]
+        model = self._model_from_combo_selection(provider, selected)
+        self.settings["vision_model"] = model
+        self._save_settings()
+        return model
 
     def _log(self, message: str, is_error: bool = False):
         prefix = "ERROR" if is_error else "INFO"
-        self._write_log_line(f"{prefix} {message}")
+        formatted = f"{prefix} {message}"
+        self._write_log_line(formatted)
+        print(formatted, flush=True)
 
     def _on_card_identified(
         self,
@@ -1884,6 +2495,7 @@ class MainWindow(QMainWindow):
 
         provider = self.provider_combo.currentText()
         model = self._selected_model()
+        pricing_cfg = self._scan_default_pricing_config()
 
         self.cancel_event = threading.Event()
         self._clear_stream_output()
@@ -1898,6 +2510,10 @@ class MainWindow(QMainWindow):
             output_path=str(output_path),
             provider=provider,
             model=model,
+            pricing_source=pricing_cfg.source,
+            pricing_provider=pricing_cfg.provider,
+            pricing_side=pricing_cfg.side,
+            pricing_fallback_to_scryfall=pricing_cfg.fallback_to_scryfall,
             cancel_event=self.cancel_event,
         )
         self.worker.status.connect(self._on_status)
@@ -1946,7 +2562,15 @@ class MainWindow(QMainWindow):
 
     def _finish_display(self, raw_finish: str) -> str:
         normalized = str(raw_finish or "unknown").strip().lower()
-        return {"foil": "Foil", "nonfoil": "Non-foil"}.get(normalized, "Unknown")
+        return {"foil": "Foil", "nonfoil": "Non-foil", "etched": "Etched"}.get(normalized, "Unknown")
+
+    def _finish_raw(self, finish_value: str) -> str:
+        normalized = str(finish_value or "unknown").strip().lower()
+        if normalized in {"non-foil", "nonfoil"}:
+            return "nonfoil"
+        if normalized in {"foil", "etched"}:
+            return normalized
+        return "unknown"
 
     def _load_collection(self):
         if self.current_collection_path:
@@ -1980,6 +2604,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "Unsupported JSON format. Expected object or array.")
             return
 
+        self.collection_pricing_config = self._load_collection_pricing_for_path(self.current_collection_path)
+        self._apply_collection_pricing_controls(self.collection_pricing_config)
+        pricing_cfg = self._current_collection_pricing_config()
+        should_attempt_uuid_backfill = pricing_cfg.source == "mtgjson"
+        uuid_backfill_attempts = 0
+        uuid_backfilled = 0
+        mutated_entries = False
+
         total_value = 0.0
         total_copies = 0
         rows = []
@@ -1997,8 +2629,29 @@ class MainWindow(QMainWindow):
             prices = entry.get("prices", {})
             if not isinstance(prices, dict):
                 prices = {}
-            price_usd = self._coerce_price(prices.get("usd"))
-            finish = self._finish_display(entry.get("finish", "unknown"))
+            finish_raw = self._finish_raw(entry.get("finish", "unknown"))
+
+            if (
+                should_attempt_uuid_backfill
+                and not entry.get("mtgjson_uuid")
+                and uuid_backfill_attempts < MAX_UUID_BACKFILL_PER_LOAD
+                and set_code not in {"", "N/A"}
+                and collector_number not in {"", "?"}
+            ):
+                uuid_backfill_attempts += 1
+                resolved_uuid = self.pricing_service.resolve_mtgjson_uuid(
+                    set_code=set_code,
+                    collector_number=collector_number,
+                    finish=finish_raw,
+                    scryfall_id=str(entry.get("id") or "") or None,
+                )
+                if resolved_uuid:
+                    entry["mtgjson_uuid"] = resolved_uuid
+                    mutated_entries = True
+                    uuid_backfilled += 1
+
+            price_usd = price_from_prices_dict(prices, finish_raw)
+            finish = self._finish_display(finish_raw)
             image_url = self._extract_image_url(entry)
 
             total_value += price_usd * count
@@ -2009,9 +2662,13 @@ class MainWindow(QMainWindow):
                     "name": name,
                     "count": count,
                     "set_code": set_code,
+                    "set_name": str(entry.get("set_name", "") or ""),
                     "collector_number": collector_number,
                     "rarity": rarity,
+                    "finish_raw": finish_raw,
                     "finish": finish,
+                    "prices": prices,
+                    "mtgjson_uuid": entry.get("mtgjson_uuid"),
                     "price_value": price_usd,
                     "price_str": f"${price_usd:.2f}",
                     "image_url": image_url,
@@ -2023,6 +2680,20 @@ class MainWindow(QMainWindow):
         self._render_table()
         self._render_grid()
         self._animate_view_fade(self.collection_stack.currentWidget())
+
+        if mutated_entries and self.current_collection_path:
+            try:
+                if isinstance(cards_data, dict):
+                    with open(self.current_collection_path, "w", encoding="utf-8") as handle:
+                        json.dump(dict(sorted(cards_data.items())), handle, indent=2, ensure_ascii=False)
+                elif isinstance(cards_data, list):
+                    with open(self.current_collection_path, "w", encoding="utf-8") as handle:
+                        json.dump(cards_data, handle, indent=2, ensure_ascii=False)
+                self._log(
+                    f"Backfilled MTGJSON UUIDs for {uuid_backfilled} card(s) while loading collection"
+                )
+            except OSError:
+                self._log("Could not persist MTGJSON UUID backfill to collection file", is_error=True)
 
         self.total_value_label.setText(f"${total_value:.2f}")
         self.summary_label.setText(f"Unique Cards: {len(self.collection_rows)} | Total Copies: {total_copies}")

@@ -7,21 +7,83 @@ Public function:
     candidate: { "name": str|None, "set_code": str|None, "collector_number": str|None, ... }
 
     Returns a Scryfall card object (subset of fields) or None if unresolvable.
+
+Disk cache:
+    Results are persisted to scryfall_cache.json (or SCRYFALL_CACHE_PATH env var).
+    Resolved cards are cached for RESOLVE_TTL_DAYS days.
+    Print-option listings are cached for PRINT_OPTIONS_TTL_DAYS days.
 """
 
+import json
+import os
 import time
+from pathlib import Path
+
 import requests
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://api.scryfall.com"
 HEADERS  = {"User-Agent": "MTGBinderScanner/1.0", "Accept": "application/json"}
-MIN_REQUEST_INTERVAL = 0.25  # ~4 req/s max, conservative to avoid rate limiting
+MIN_REQUEST_INTERVAL = 0.10  # 100 ms between requests (~10 req/s, Scryfall's stated limit)
 MAX_RETRIES = 5  # for 429 / transient errors
 
-# ── In-memory cache (keyed by resolved Scryfall card id) ──────────────────────
-_cache: dict[str, dict] = {}
+RESOLVE_TTL_DAYS      = 7    # card identity changes rarely
+PRINT_OPTIONS_TTL_DAYS = 1   # print listings include prices, refresh daily
+
+# ── Disk cache ────────────────────────────────────────────────────────────────
+def _cache_path() -> Path:
+    env = os.environ.get("SCRYFALL_CACHE_PATH", "").strip()
+    if env:
+        return Path(env)
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / "MTGBinderScanner" / "scryfall_cache.json"
+
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg_cache:
+        return Path(xdg_cache) / "mtgscanner" / "scryfall_cache.json"
+
+    return Path.home() / ".cache" / "mtgscanner" / "scryfall_cache.json"
+
+
+def _load_disk_cache() -> dict:
+    path = _cache_path()
+    if not path.exists():
+        return {"resolved": {}, "print_options": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"resolved": {}, "print_options": {}}
+        data.setdefault("resolved", {})
+        data.setdefault("print_options", {})
+        return data
+    except Exception:
+        return {"resolved": {}, "print_options": {}}
+
+
+def _save_disk_cache() -> None:
+    path = _cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_disk_cache, f, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        print(f"  [scryfall] Warning: could not save disk cache: {exc}")
+
+
+def _is_fresh(entry: dict, ttl_days: float) -> bool:
+    cached_at = entry.get("cached_at", 0)
+    return (time.time() - cached_at) < (ttl_days * 86400)
+
+
+_disk_cache: dict = _load_disk_cache()
+
+# ── In-memory session de-dupe (subset of disk cache, avoids repeated JSON I/O) ─
+_memory_cache: dict[str, dict | None] = {}
+_print_options_memory: dict[str, list[dict]] = {}
 _last_request_ts = 0.0
-_print_options_cache: dict[str, list[dict]] = {}
 
 # Fields to extract from a Scryfall card object
 _WANTED_FIELDS = [
@@ -64,7 +126,15 @@ def _get(url: str, params: dict | None = None) -> dict | None:
         if r.status_code == 404:
             return None  # not found — caller handles
         if r.status_code == 429:
-            backoff = min(1.0 if backoff == 0.0 else backoff * 2, 10.0)
+            # Respect Retry-After header if present, otherwise exponential backoff
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    backoff = max(float(retry_after), 1.0)
+                except ValueError:
+                    backoff = 5.0
+            else:
+                backoff = min(2.0 if backoff == 0.0 else backoff * 2, 30.0)
             print(f"  [scryfall] 429 rate limit — retrying in {backoff:.1f}s …")
             continue
         # Any other non-200
@@ -116,7 +186,7 @@ def _lookup_by_name(name: str) -> dict | None:
 
 def resolve(candidate: dict) -> dict | None:
     """
-    Try to resolve a GPT-4o candidate to a Scryfall card object.
+    Try to resolve a candidate to a Scryfall card object.
 
     Waterfall:
       1. set_code + collector_number  →  /cards/:set/:number
@@ -124,17 +194,25 @@ def resolve(candidate: dict) -> dict | None:
       3. name only                    →  /cards/named?fuzzy=
       4. unresolvable                 →  None
 
-    Caches results to avoid duplicate API calls.
+    Results are persisted to disk (RESOLVE_TTL_DAYS day TTL).
     """
     name   = (candidate.get("name") or "").strip()
     setn   = (candidate.get("set_code") or "").strip().lower()
     number = (candidate.get("collector_number") or "").strip()
 
-    # Build a dedupe key for the cache
     cache_key = f"{name.lower()}|{setn}|{number}" if name else None
 
-    if cache_key and cache_key in _cache:
-        return _cache[cache_key]
+    # 1. Memory (session) cache
+    if cache_key and cache_key in _memory_cache:
+        return _memory_cache[cache_key]
+
+    # 2. Disk cache
+    if cache_key:
+        disk_entry = _disk_cache["resolved"].get(cache_key)
+        if disk_entry and _is_fresh(disk_entry, RESOLVE_TTL_DAYS):
+            result = disk_entry["data"]   # may be None (cached miss)
+            _memory_cache[cache_key] = result
+            return result
 
     card = None
     match_method = None
@@ -163,14 +241,18 @@ def resolve(candidate: dict) -> dict | None:
     if card is None:
         print(f"    [scryfall] ✗ Unresolved: name={name!r} set={setn!r} num={number!r}")
         if cache_key:
-            _cache[cache_key] = None  # cache the miss to avoid repeat calls
+            _memory_cache[cache_key] = None
+            _disk_cache["resolved"][cache_key] = {"data": None, "cached_at": time.time()}
+            _save_disk_cache()
         return None
 
     slim = _extract(card)
     slim["match_method"] = match_method or "unknown"
 
     if cache_key:
-        _cache[cache_key] = slim
+        _memory_cache[cache_key] = slim
+        _disk_cache["resolved"][cache_key] = {"data": slim, "cached_at": time.time()}
+        _save_disk_cache()
 
     return slim
 
@@ -183,9 +265,17 @@ def get_print_options(name: str) -> list[dict]:
         return []
 
     cache_key = normalized_name.lower()
-    cached = _print_options_cache.get(cache_key)
-    if cached is not None:
-        return cached
+
+    # 1. Memory (session) cache
+    if cache_key in _print_options_memory:
+        return _print_options_memory[cache_key]
+
+    # 2. Disk cache
+    disk_entry = _disk_cache["print_options"].get(cache_key)
+    if disk_entry and _is_fresh(disk_entry, PRINT_OPTIONS_TTL_DAYS):
+        result = disk_entry["data"]
+        _print_options_memory[cache_key] = result
+        return result
 
     query = f'!"{normalized_name}"'
     response = _get(
@@ -193,7 +283,9 @@ def get_print_options(name: str) -> list[dict]:
         params={"q": query, "unique": "prints", "order": "released", "dir": "desc"},
     )
     if not response:
-        _print_options_cache[cache_key] = []
+        _print_options_memory[cache_key] = []
+        _disk_cache["print_options"][cache_key] = {"data": [], "cached_at": time.time()}
+        _save_disk_cache()
         return []
 
     all_cards: list[dict] = []
@@ -262,5 +354,17 @@ def get_print_options(name: str) -> list[dict]:
                 }
             )
 
-    _print_options_cache[cache_key] = options
+    _print_options_memory[cache_key] = options
+    _disk_cache["print_options"][cache_key] = {"data": options, "cached_at": time.time()}
+    _save_disk_cache()
     return options
+
+
+def clear_cache() -> None:
+    """Wipe both the in-memory and on-disk Scryfall caches."""
+    global _disk_cache
+    _memory_cache.clear()
+    _print_options_memory.clear()
+    _disk_cache = {"resolved": {}, "print_options": {}}
+    _save_disk_cache()
+    print("  [scryfall] Cache cleared.")

@@ -15,8 +15,8 @@ import requests
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_URL = "https://api.scryfall.com"
 HEADERS  = {"User-Agent": "MTGBinderScanner/1.0", "Accept": "application/json"}
-MIN_REQUEST_INTERVAL = 0.11  # ~9 req/s max, safely under Scryfall's 10 req/s guidance
-MAX_RETRIES = 4  # for 429 / transient errors
+MIN_REQUEST_INTERVAL = 0.25  # ~4 req/s max, conservative to avoid rate limiting
+MAX_RETRIES = 5  # for 429 / transient errors
 
 # ── In-memory cache (keyed by resolved Scryfall card id) ──────────────────────
 _cache: dict[str, dict] = {}
@@ -64,7 +64,7 @@ def _get(url: str, params: dict | None = None) -> dict | None:
         if r.status_code == 404:
             return None  # not found — caller handles
         if r.status_code == 429:
-            backoff = min(0.5 if backoff == 0.0 else backoff * 2, 5.0)
+            backoff = min(1.0 if backoff == 0.0 else backoff * 2, 10.0)
             print(f"  [scryfall] 429 rate limit — retrying in {backoff:.1f}s …")
             continue
         # Any other non-200
@@ -92,14 +92,26 @@ def _lookup_by_set_number(set_code: str, number: str) -> dict | None:
     return _get(url)
 
 
+def _normalize_card_name(name: str) -> str:
+    """
+    Handle MDFC (Modal Double-Faced Card) names.
+    Scryfall API expects only the front face name (e.g., "Archangel" not "Archangel // Priest").
+    """
+    if "//" in name:
+        return name.split("//")[0].strip()
+    return name
+
+
 def _lookup_by_name_and_set(name: str, set_code: str) -> dict | None:
     """Level 2: fuzzy name + set hint."""
-    return _get(f"{BASE_URL}/cards/named", params={"fuzzy": name, "set": set_code.lower()})
+    normalized_name = _normalize_card_name(name)
+    return _get(f"{BASE_URL}/cards/named", params={"fuzzy": normalized_name, "set": set_code.lower()})
 
 
 def _lookup_by_name(name: str) -> dict | None:
     """Level 3: fuzzy name only — no set constraint."""
-    return _get(f"{BASE_URL}/cards/named", params={"fuzzy": name})
+    normalized_name = _normalize_card_name(name)
+    return _get(f"{BASE_URL}/cards/named", params={"fuzzy": normalized_name})
 
 
 def resolve(candidate: dict) -> dict | None:
@@ -165,7 +177,8 @@ def resolve(candidate: dict) -> dict | None:
 
 def get_print_options(name: str) -> list[dict]:
     """Return all known set/collector/treatment options for an exact card name."""
-    normalized_name = (name or "").strip()
+    raw_name = (name or "").strip()
+    normalized_name = _normalize_card_name(raw_name)
     if not normalized_name:
         return []
 

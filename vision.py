@@ -33,9 +33,9 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 load_dotenv()
 
-MAX_RETRIES = 5
+MAX_RETRIES = 10
 INITIAL_RETRY_DELAY_SECONDS = 2.0
-MAX_RETRY_DELAY_SECONDS = 30.0
+MAX_RETRY_DELAY_SECONDS = 6.0
 PREPROCESS_MAX_EDGE = 2200
 
 # ── JSON schema for Structured Outputs ────────────────────────────────────────

@@ -1,0 +1,123 @@
+# Building the MTG Scanner EXE
+
+This guide explains how to convert the MTG Scanner app into a standalone Windows EXE file.
+
+## Prerequisites
+
+1. Python 3.8 or higher installed
+2. All dependencies from `requirements.txt` (plus PyInstaller)
+
+## Step-by-Step Build Instructions
+
+### 1. Install PyInstaller
+
+If you haven't already, install PyInstaller:
+
+```powershell
+pip install pyinstaller
+```
+
+Or update your `requirements-dev.txt` with:
+
+```
+pyinstaller>=6.0.0
+```
+
+### 2. Set Up Your Environment Variables
+
+Before building, ensure your `.env` file is in the project root with your API keys:
+
+```
+OPENAI_API_KEY=your-key-here
+GOOGLE_API_KEY=your-key-here
+```
+
+### 3. Build the EXE
+
+Run the build script from the project directory:
+
+```powershell
+python build_exe.py
+```
+
+The script will:
+- Compile all Python files and dependencies
+- Bundle everything into a single EXE file
+- Create the executable at `dist/MTGScanner.exe`
+- Generate build artifacts in the `build/` folder
+
+The build process may take 1-3 minutes depending on your system.
+
+### 4. Deploy and Run
+
+Once built, you can:
+
+**Option A: Run from the dist folder**
+```powershell
+./dist/MTGScanner.exe
+```
+
+**Option B: Copy the EXE to another location**
+```powershell
+# Copy the EXE
+Copy-Item dist/MTGScanner.exe "C:\path\to\your\folder\MTGScanner.exe"
+
+# Copy your .env file to the same folder (for API keys)
+Copy-Item .env "C:\path\to\your\folder\.env"
+```
+
+The EXE must be able to find your `.env` file in the same directory.
+
+### 5. Troubleshooting
+
+**"API key not found" error:**
+- Ensure `.env` is in the same directory as `MTGScanner.exe`
+- Make sure `OPENAI_API_KEY` and/or `GOOGLE_API_KEY` are set
+
+**"Module not found" error:**
+- Rebuild with: `python build_exe.py`
+- Delete `build/` and `dist/` folders before rebuilding if issues persist
+
+**File size too large:**
+- The EXE is typically 100-200 MB due to bundled dependencies (OpenAI, Google, Pillow, etc.)
+- This is normal and expected
+
+## Creating a Shortcut
+
+To create a desktop shortcut to the EXE:
+
+1. Right-click on `MTGScanner.exe`
+2. Select "Create Shortcut" or drag while holding Alt
+3. Move the shortcut to your Desktop or Start Menu
+
+You can optionally set a working directory for the shortcut to ensure `.env` is found.
+
+## Rebuilding After Code Changes
+
+After modifying the code:
+
+1. Rebuild: `python build_exe.py`
+2. The new EXE will be in `dist/MTGScanner.exe`
+
+## Backup and Cleanup
+
+Before rebuilding, you may want to archive the old EXE:
+
+```powershell
+# Backup current EXE
+if (Test-Path dist/MTGScanner.exe) {
+    Copy-Item dist/MTGScanner.exe "dist/MTGScanner.exe.backup"
+}
+```
+
+To clean up build artifacts:
+
+```powershell
+Remove-Item -Recurse build/
+Remove-Item -Recurse dist/
+Remove-Item *.spec
+```
+
+---
+
+**Questions?** Check the build output for detailed errors, or refer to [PyInstaller Documentation](https://pyinstaller.org/).
